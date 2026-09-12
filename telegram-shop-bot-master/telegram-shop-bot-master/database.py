@@ -98,7 +98,7 @@ class Database:
             )
         ''')
         
-        # ⭐ НОВОЕ: Категории с поддержкой подкатегорий
+        # Категории с поддержкой подкатегорий
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +114,7 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_categories_active ON categories(is_active)')
         
-        # ⭐ ОБНОВЛЕНО: Товары с category_id и photo_path
+        # Товары
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,8 +135,8 @@ class Database:
         ''')
         
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_in_stock ON products(in_stock)')
+        # ⚠️ Индекс idx_products_category_id создаём в update_structure()
         
         # Заказы с историей статусов
         cursor.execute('''
@@ -208,7 +208,7 @@ class Database:
             except:
                 pass
         
-        # ⭐ НОВОЕ: добавляем category_id и photo_path в products
+        # Добавляем category_id и photo_path в products
         for col, sql in [
             ("category_id", "ALTER TABLE products ADD COLUMN category_id INTEGER"),
             ("photo_path", "ALTER TABLE products ADD COLUMN photo_path TEXT"),
@@ -218,6 +218,13 @@ class Database:
                 logger.info(f"✅ Добавлена колонка {col} в products")
             except:
                 pass
+        
+        # ⭐ Только теперь создаём индекс (после ALTER TABLE)
+        try:
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id)')
+            logger.info("✅ Создан индекс idx_products_category_id")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось создать индекс idx_products_category_id: {e}")
         
         conn.commit()
         conn.close()
@@ -308,10 +315,9 @@ class Database:
         
         return referral_code
     
-    # ========== РАБОТА С КАТЕГОРИЯМИ (НОВОЕ) ==========
+    # ========== РАБОТА С КАТЕГОРИЯМИ ==========
     
     def add_category(self, name, parent_id=None):
-        """Добавить категорию или подкатегорию"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
@@ -325,7 +331,6 @@ class Database:
         return cat_id
     
     def get_categories(self, parent_id=None, active_only=True):
-        """Получить категории (верхний уровень или подкатегории)"""
         cache_key = f"categories_{parent_id}_{active_only}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -355,7 +360,6 @@ class Database:
         return result
     
     def get_category(self, category_id):
-        """Получить категорию по ID"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT id, name, parent_id FROM categories WHERE id = ?", (category_id,))
@@ -364,10 +368,8 @@ class Database:
         return dict(cat) if cat else None
     
     def delete_category(self, category_id):
-        """Удалить категорию и все её подкатегории"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        # Удаляем подкатегории
         cursor.execute("SELECT id FROM categories WHERE parent_id = ?", (category_id,))
         subcats = cursor.fetchall()
         for sub in subcats:
@@ -379,7 +381,6 @@ class Database:
         return True
     
     def has_subcategories(self, category_id):
-        """Проверить, есть ли у категории подкатегории"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id = ? AND is_active = 1", (category_id,))
@@ -388,7 +389,6 @@ class Database:
         return count > 0
     
     def count_categories(self, parent_id=None):
-        """Количество категорий (для пагинации)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -404,7 +404,6 @@ class Database:
     # ========== РАБОТА С ТОВАРАМИ ==========
     
     def get_products(self, only_in_stock=True, category=None):
-        """Получение списка товаров (с кэшированием)"""
         cache_key = f"products_{only_in_stock}_{category}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -436,7 +435,6 @@ class Database:
         return result
     
     def get_products_by_category(self, category_id, page=1, per_page=5):
-        """⭐ Товары категории с пагинацией"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -467,7 +465,6 @@ class Database:
         }
     
     def get_all_products_paginated(self, page=1, per_page=5):
-        """⭐ Все товары без категории — с пагинацией"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -495,7 +492,6 @@ class Database:
         }
     
     def get_product(self, product_id):
-        """Получение товара по ID (с кэшированием)"""
         cache_key = f"product_{product_id}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -517,7 +513,6 @@ class Database:
     
     def add_product(self, name, category, price, stock, photo_file_id, created_by, 
                     category_id=None, photo_path=None):
-        """⭐ Добавление нового товара (с category_id и photo_path)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -541,7 +536,6 @@ class Database:
         return product_id
     
     def update_product(self, product_id, **kwargs):
-        """Обновление товара"""
         allowed_fields = {'name', 'category', 'category_id', 'price', 'stock', 
                           'photo_file_id', 'photo_path', 'in_stock'}
         updates = []
@@ -570,7 +564,6 @@ class Database:
         return True
     
     def delete_product(self, product_id):
-        """Удаление товара"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
@@ -582,7 +575,6 @@ class Database:
         return True
     
     def toggle_stock(self, product_id):
-        """Переключение статуса наличия"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT in_stock FROM products WHERE id = ?", (product_id,))
@@ -603,7 +595,6 @@ class Database:
     # ========== РАБОТА С ЗАКАЗАМИ ==========
     
     def create_order(self, user_id, user_name, user_phone, username, items, total, address, comment):
-        """Создание нового заказа"""
         import random
         import string
         
@@ -854,7 +845,6 @@ class Database:
         
         stats = {}
         
-        # Товары
         cursor.execute("SELECT COUNT(*) FROM products")
         stats['total_products'] = cursor.fetchone()[0]
         
@@ -865,14 +855,12 @@ class Database:
         total_stock = cursor.fetchone()[0]
         stats['total_stock'] = total_stock if total_stock else 0
         
-        # ⭐ НОВОЕ: Категории
         cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id IS NULL")
         stats['total_categories'] = cursor.fetchone()[0]
         
         cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id IS NOT NULL")
         stats['total_subcategories'] = cursor.fetchone()[0]
         
-        # Пользователи
         cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'user'")
         stats['total_users'] = cursor.fetchone()[0]
         
@@ -882,7 +870,6 @@ class Database:
         cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")
         stats['referred_users'] = cursor.fetchone()[0]
         
-        # Заказы
         cursor.execute("SELECT COUNT(*) FROM orders")
         stats['total_orders'] = cursor.fetchone()[0]
         
@@ -901,7 +888,6 @@ class Database:
         revenue_today = cursor.fetchone()[0]
         stats['revenue_today'] = revenue_today if revenue_today else 0
         
-        # Рефералы
         cursor.execute("SELECT COUNT(*) FROM referrals WHERE order_made = 1")
         stats['referrals_with_orders'] = cursor.fetchone()[0]
         
