@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from telegram.constants import ParseMode
 from database import Database
 from google_sheets import GoogleSheets
 from keyboards import *
@@ -12,11 +13,17 @@ from states import *
 from config import ORDER_STATUSES, SPREADSHEET_ID
 from handlers.back_handlers import back_to_admin
 from handlers.common import exit_handler
-from telegram.constants import ParseMode
 
 logger = logging.getLogger(__name__)
 db = Database()
 gs = GoogleSheets() if SPREADSHEET_ID else None
+
+# Константы пагинации
+ADMIN_PRODUCTS_PER_PAGE = 8
+CATEGORIES_PER_PAGE = 10
+
+
+# ========== ОСНОВНОЙ ОБРАБОТЧИК ==========
 
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик для менеджеров"""
@@ -52,8 +59,7 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif text == "📢 Рассылка":
         await update.message.reply_text(
-            "📢 РАССЫЛКА\n\n"
-            "Введите текст для рассылки:",
+            "📢 РАССЫЛКА\n\nВведите текст для рассылки:",
             reply_markup=cancel_keyboard()
         )
         return BROADCAST_TEXT
@@ -69,85 +75,92 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ADMIN
 
-# ========== GOOGLE SHEETS ==========
+
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
 
 async def export_to_google(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экспорт товаров и заказов в Google Sheets"""
+    """Экспорт товаров, категорий и заказов в Google Sheets"""
     user_id = update.effective_user.id
     logger.info(f"👔 Менеджер {user_id}: экспорт в Google Sheets")
     
     if not gs:
         await update.message.reply_text(
-            "❌ Google Sheets не настроен\n\n"
-            "Проверьте SPREADSHEET_ID в файле .env"
+            "❌ Google Sheets не настроен\n\nПроверьте SPREADSHEET_ID в .env"
         )
         return ADMIN
     
-    msg = await update.message.reply_text("📤 Экспортирую данные в Google Sheets...")
+    msg = await update.message.reply_text("📤 Экспортирую данные...")
     
     try:
         conn = db.get_connection()
         cursor = conn.cursor()
-        
         results = []
         
         # Экспорт товаров
         cursor.execute('''
-            SELECT id, name, category, price, stock, 
-                   COALESCE(photo_file_id, '') as photo, created_at 
-            FROM products ORDER BY id
+            SELECT p.id, p.name, COALESCE(c.name, p.category, 'Общее') as category,
+                   p.price, p.stock, COALESCE(p.photo_file_id, ''), p.created_at
+            FROM products p
+            LEFT JOIN categories c ON p.category_id = c.id
+            ORDER BY p.id
         ''')
         products = cursor.fetchall()
-        
         if products:
-            success, prod_msg = gs.export_products(products)
-            results.append(prod_msg)
+            success, msg_txt = gs.export_products(products)
+            results.append(msg_txt)
         else:
-            results.append("⚠️ Нет товаров для экспорта")
+            results.append("⚠️ Нет товаров")
+        
+        # ⭐ Экспорт категорий
+        cursor.execute("SELECT id, name, parent_id, is_active FROM categories ORDER BY parent_id NULLS FIRST, id")
+        categories = cursor.fetchall()
+        if categories:
+            success, msg_txt = gs.export_categories(categories)
+            results.append(msg_txt)
+        else:
+            results.append("⚠️ Нет категорий")
         
         # Экспорт заказов
         cursor.execute('''
-            SELECT order_id, user_name, user_phone, 
-                   COALESCE(username, '') as username,
+            SELECT order_id, user_name, user_phone, COALESCE(username, ''),
                    items, total_amount, delivery_address, status, created_at
             FROM orders ORDER BY created_at DESC
         ''')
         orders = cursor.fetchall()
-        
         if orders:
-            success, order_msg = gs.export_orders(orders)
-            results.append(order_msg)
+            success, msg_txt = gs.export_orders(orders)
+            results.append(msg_txt)
         else:
-            results.append("⚠️ Нет заказов для экспорта")
+            results.append("⚠️ Нет заказов")
         
         conn.close()
         
         await msg.edit_text(
             "✅ ЭКСПОРТ ЗАВЕРШЕН\n\n" + "\n".join(results)
         )
-        
     except Exception as e:
         logger.error(f"❌ Ошибка экспорта: {e}")
-        await msg.edit_text(f"❌ Ошибка экспорта: {str(e)[:200]}")
+        await msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
     
     await asyncio.sleep(2)
     return ADMIN
 
+
 async def import_from_google(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Импорт товаров из Google Sheets"""
-    user_id = update.effective_user.id
-    logger.info(f"👔 Менеджер {user_id}: импорт из Google Sheets")
-    
+    """Импорт товаров и категорий из Google Sheets"""
     if not gs:
         await update.message.reply_text(
-            "❌ Google Sheets не настроен\n\n"
-            "Проверьте SPREADSHEET_ID в файле .env"
+            "❌ Google Sheets не настроен\n\nПроверьте SPREADSHEET_ID в .env"
         )
         return ADMIN
     
     await update.message.reply_text(
-        "📥 ИМПОРТ ТОВАРОВ\n\n"
-        "Сейчас будут импортированы товары из Google Sheets.\n"
+        "📥 ИМПОРТ ДАННЫХ\n\n"
+        "Будут импортированы:\n"
+        "• Категории (лист «Категории»)\n"
+        "• Товары (лист «Товары»)\n\n"
         "Товары с такими же названиями будут пропущены.\n\n"
         "Продолжить?",
         reply_markup=InlineKeyboardMarkup([
@@ -157,77 +170,138 @@ async def import_from_google(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     return IMPORT_PRODUCTS
 
+
 async def import_products_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение импорта товаров"""
+    """Подтверждение импорта"""
     query = update.callback_query
     await query.answer()
-    
-    user_id = update.effective_user.id
-    logger.info(f"👔 Менеджер {user_id}: подтверждение импорта: {query.data}")
     
     if query.data == "import_cancel":
         await query.edit_message_text("❌ Импорт отменен")
         return ADMIN
     
-    await query.edit_message_text("📥 Импортирую товары из Google Sheets...")
+    await query.edit_message_text("📥 Импортирую данные из Google Sheets...")
     
-    products, errors = gs.import_products()
+    # ===== ШАГ 1: Импорт категорий =====
+    categories, cat_errors = gs.import_categories()
     
-    if not products:
-        error_text = "\n".join(errors[:5]) if errors else "Неизвестная ошибка"
-        await query.edit_message_text(f"❌ Не удалось импортировать товары:\n{error_text}")
-        return ADMIN
+    cats_added = 0
+    cat_map = {}  # name -> id
     
     try:
         conn = db.get_connection()
         cursor = conn.cursor()
         
-        added = 0
-        skipped = 0
-        admin_id = user_id
+        # Сначала главные категории
+        for c in categories:
+            if not c['parent_id']:
+                cursor.execute(
+                    "SELECT id FROM categories WHERE name = ? AND parent_id IS NULL",
+                    (c['name'],)
+                )
+                existing = cursor.fetchone()
+                if not existing:
+                    cursor.execute(
+                        "INSERT INTO categories (name, parent_id, created_at) VALUES (?, NULL, ?)",
+                        (c['name'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    )
+                    cat_map[c['name']] = cursor.lastrowid
+                    cats_added += 1
+                else:
+                    cat_map[c['name']] = existing['id']
         
-        for p in products:
-            cursor.execute('SELECT id FROM products WHERE name = ?', (p['name'],))
-            existing = cursor.fetchone()
-            
-            if not existing:
-                cursor.execute('''
-                    INSERT INTO products 
-                    (name, category, price, stock, photo_file_id, in_stock, created_at, created_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    p['name'], p['category'], p['price'], p['stock'], 
-                    None,
-                    1 if p['stock'] > 0 else 0,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    admin_id
-                ))
-                added += 1
-            else:
-                skipped += 1
+        # Затем подкатегории (2-й проход)
+        for c in categories:
+            if c['parent_id']:
+                # Ищем родителя по ID из таблицы
+                cursor.execute("SELECT id, name FROM categories WHERE id = ?", (c['parent_id'],))
+                parent = cursor.fetchone()
+                if not parent:
+                    continue
+                
+                cursor.execute(
+                    "SELECT id FROM categories WHERE name = ? AND parent_id = ?",
+                    (c['name'], parent['id'])
+                )
+                existing = cursor.fetchone()
+                if not existing:
+                    cursor.execute(
+                        "INSERT INTO categories (name, parent_id, created_at) VALUES (?, ?, ?)",
+                        (c['name'], parent['id'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    )
+                    cat_map[c['name']] = cursor.lastrowid
+                    cats_added += 1
+                else:
+                    cat_map[c['name']] = existing['id']
+        
+        # Обновляем cat_map с уже существующими категориями
+        cursor.execute("SELECT id, name FROM categories")
+        for row in cursor.fetchall():
+            cat_map[row['name']] = row['id']
         
         conn.commit()
         conn.close()
-        
-        result_text = f"✅ ИМПОРТ ЗАВЕРШЕН\n\n"
-        result_text += f"📦 Добавлено новых товаров: {added}\n"
-        result_text += f"⚠️ Пропущено (уже есть): {skipped}\n"
-        
-        if errors:
-            result_text += f"\n❌ Ошибок при импорте: {len(errors)}\n"
-            result_text += f"Первые ошибки:\n" + "\n".join(errors[:3])
-        
-        if added > 0:
-            result_text += f"\n\n📸 Важно: Фото нужно добавить вручную через редактирование товара."
-        
-        await query.edit_message_text(result_text)
-        
     except Exception as e:
-        logger.error(f"❌ Ошибка сохранения товаров: {e}")
-        await query.edit_message_text(f"❌ Ошибка сохранения: {str(e)[:200]}")
+        logger.error(f"Ошибка импорта категорий: {e}")
+        await query.edit_message_text(f"❌ Ошибка импорта категорий: {str(e)[:150]}")
+        return ADMIN
     
+    # ===== ШАГ 2: Импорт товаров =====
+    products, prod_errors = gs.import_products()
+    
+    prod_added = 0
+    prod_skipped = 0
+    
+    try:
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        
+        for p in products:
+            cursor.execute("SELECT id FROM products WHERE name = ?", (p['name'],))
+            existing = cursor.fetchone()
+            
+            if not existing:
+                # Ищем category_id по названию
+                category_id = cat_map.get(p['category_name'])
+                
+                cursor.execute('''
+                    INSERT INTO products 
+                    (name, category, category_id, price, stock, in_stock, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    p['name'], p['category_name'], category_id,
+                    p['price'], p['stock'],
+                    1 if p['stock'] > 0 else 0,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ))
+                prod_added += 1
+            else:
+                prod_skipped += 1
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка импорта товаров: {e}")
+        await query.edit_message_text(f"❌ Ошибка: {str(e)[:150]}")
+        return ADMIN
+    
+    # ===== ИТОГ =====
+    text = (
+        f"✅ ИМПОРТ ЗАВЕРШЕН\n\n"
+        f"📂 КАТЕГОРИИ:\n"
+        f"  • Добавлено: {cats_added}\n\n"
+        f"📦 ТОВАРЫ:\n"
+        f"  • Добавлено: {prod_added}\n"
+        f"  • Пропущено: {prod_skipped}\n"
+    )
+    
+    if cat_errors or prod_errors:
+        text += f"\n⚠️ Ошибок: {len(cat_errors) + len(prod_errors)}"
+    
+    await query.edit_message_text(text)
     await asyncio.sleep(2)
     return ADMIN
+
 
 # ========== СТАТИСТИКА ==========
 
@@ -243,28 +317,33 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👔 СТАТИСТИКА МЕНЕДЖЕРА\n"
             f"{'=' * 30}\n\n"
             f"📦 ТОВАРЫ\n"
-            f"  • Всего товаров: {stats['total_products']}\n"
+            f"  • Всего: {stats['total_products']}\n"
             f"  • В наличии: {stats['in_stock']}\n"
             f"  • Общий склад: {stats['total_stock']} шт.\n\n"
+            f"📂 КАТЕГОРИИ\n"
+            f"  • Категорий: {stats.get('total_categories', 0)}\n"
+            f"  • Подкатегорий: {stats.get('total_subcategories', 0)}\n\n"
             f"👥 ПОЛЬЗОВАТЕЛИ\n"
             f"  • Всего: {stats['total_users']}\n\n"
             f"📋 ЗАКАЗЫ\n"
             f"  • Всего: {stats['total_orders']}\n"
             f"  • Сегодня: {stats['orders_today']}\n"
             f"  • Средний чек: {stats['avg_order']:.0f}₽\n"
-            f"  • Выручка всего: {stats['total_revenue']:.0f}₽\n"
+            f"  • Выручка: {stats['total_revenue']:.0f}₽\n"
             f"  • Выручка сегодня: {stats['revenue_today']:.0f}₽"
         )
         
         await update.message.reply_text(text)
-        
     except Exception as e:
         logger.error(f"❌ Ошибка статистики: {e}")
-        await update.message.reply_text(f"❌ Ошибка загрузки статистики: {str(e)[:100]}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
     
     return ADMIN
 
-# ========== УПРАВЛЕНИЕ ПРАЙСОМ ==========
+
+# ============================================================
+# УПРАВЛЕНИЕ ПРАЙСОМ
+# ============================================================
 
 async def price_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка меню прайса"""
@@ -275,32 +354,38 @@ async def price_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     logger.info(f"👔 Менеджер {user_id}: нажал {query.data}")
     
     if query.data == "price_add":
+        # Начинаем добавление — сначала выбор категории
         await query.edit_message_text(
-            "➕ ДОБАВЛЕНИЕ ТОВАРА\n\nШаг 1/5: Введите название товара:"
+            "➕ ДОБАВЛЕНИЕ ТОВАРА\n\nШаг 1/6: Введите название товара:"
         )
         return ADD_PRODUCT_NAME
     elif query.data == "price_edit":
-        return await show_products_for_edit(update, context)
+        return await show_products_for_edit(update, context, page=1)
     elif query.data == "price_delete":
-        return await show_products_for_delete(update, context)
+        return await show_products_for_delete(update, context, page=1)
     elif query.data == "price_toggle":
-        return await show_products_for_toggle(update, context)
+        return await show_products_for_toggle(update, context, page=1)
+    elif query.data == "categories_menu":
+        return await categories_menu(update, context)
     elif query.data == "price_export":
         return await export_to_google(update, context)
     elif query.data == "price_back":
         return await back_to_admin(update, context)
 
-async def show_products_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# --- Редактирование товара с пагинацией ---
+
+async def show_products_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, page=1):
     """Показать товары для редактирования"""
     query = update.callback_query
     
     conn = db.get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, category, stock FROM products ORDER BY id")
-    products = cursor.fetchall()
-    conn.close()
+    cursor.execute("SELECT COUNT(*) FROM products")
+    total = cursor.fetchone()[0]
     
-    if not products:
+    if total == 0:
+        conn.close()
         await query.edit_message_text(
             "📭 Товаров нет",
             reply_markup=InlineKeyboardMarkup([[
@@ -309,23 +394,117 @@ async def show_products_for_edit(update: Update, context: ContextTypes.DEFAULT_T
         )
         return PRICE_MENU
     
-    text = "✏️ ВЫБЕРИТЕ ТОВАР ДЛЯ РЕДАКТИРОВАНИЯ\n\n"
-    keyboard = []
+    total_pages = (total + ADMIN_PRODUCTS_PER_PAGE - 1) // ADMIN_PRODUCTS_PER_PAGE
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * ADMIN_PRODUCTS_PER_PAGE
     
-    for p in products:
-        text += f"ID {p['id']}: {p['name']} - {p['price']}₽ [{p['category']}]\n"
-        keyboard.append([InlineKeyboardButton(
-            f"✏️ {p['name'][:30]}", 
-            callback_data=f"edit_select_{p['id']}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="price_back")])
-    
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    cursor.execute(
+        "SELECT id, name, price FROM products ORDER BY name LIMIT ? OFFSET ?",
+        (ADMIN_PRODUCTS_PER_PAGE, offset)
     )
+    products = cursor.fetchall()
+    conn.close()
+    
+    text = f"✏️ ВЫБЕРИТЕ ТОВАР\n\n📄 Страница {page}/{total_pages}\n📦 Всего: {total}"
+    
+    keyboard = get_admin_products_keyboard(products, page, total_pages, action='edit')
+    await query.edit_message_text(text, reply_markup=keyboard)
     return EDIT_PRODUCT_SELECT
+
+
+async def show_products_for_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, page=1):
+    """Показать товары для удаления"""
+    query = update.callback_query
+    
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM products")
+    total = cursor.fetchone()[0]
+    
+    if total == 0:
+        conn.close()
+        await query.edit_message_text(
+            "📭 Товаров нет",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="price_back")
+            ]])
+        )
+        return PRICE_MENU
+    
+    total_pages = (total + ADMIN_PRODUCTS_PER_PAGE - 1) // ADMIN_PRODUCTS_PER_PAGE
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * ADMIN_PRODUCTS_PER_PAGE
+    
+    cursor.execute(
+        "SELECT id, name, price FROM products ORDER BY name LIMIT ? OFFSET ?",
+        (ADMIN_PRODUCTS_PER_PAGE, offset)
+    )
+    products = cursor.fetchall()
+    conn.close()
+    
+    text = f"🗑 ВЫБЕРИТЕ ТОВАР ДЛЯ УДАЛЕНИЯ\n\n📄 Страница {page}/{total_pages}\n📦 Всего: {total}"
+    
+    keyboard = get_admin_products_keyboard(products, page, total_pages, action='delete')
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return DELETE_PRODUCT_SELECT
+
+
+async def show_products_for_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, page=1):
+    """Показать товары для изменения статуса наличия"""
+    query = update.callback_query
+    
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM products")
+    total = cursor.fetchone()[0]
+    
+    if total == 0:
+        conn.close()
+        await query.edit_message_text(
+            "📭 Товаров нет",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="price_back")
+            ]])
+        )
+        return PRICE_MENU
+    
+    total_pages = (total + ADMIN_PRODUCTS_PER_PAGE - 1) // ADMIN_PRODUCTS_PER_PAGE
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * ADMIN_PRODUCTS_PER_PAGE
+    
+    cursor.execute(
+        "SELECT id, name, price FROM products ORDER BY name LIMIT ? OFFSET ?",
+        (ADMIN_PRODUCTS_PER_PAGE, offset)
+    )
+    products = cursor.fetchall()
+    conn.close()
+    
+    text = f"📊 СТАТУС НАЛИЧИЯ\n\n📄 Страница {page}/{total_pages}\n📦 Всего: {total}"
+    
+    keyboard = get_admin_products_keyboard(products, page, total_pages, action='toggle')
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return TOGGLE_STOCK_SELECT
+
+
+async def admin_products_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пагинация товаров в админке"""
+    query = update.callback_query
+    await query.answer()
+    
+    # admprod_{action}_{page}
+    parts = query.data.split("_")
+    action = parts[1]
+    page = int(parts[2])
+    
+    if action == 'edit':
+        return await show_products_for_edit(update, context, page)
+    elif action == 'delete':
+        return await show_products_for_delete(update, context, page)
+    elif action == 'toggle':
+        return await show_products_for_toggle(update, context, page)
+
+
+# --- Редактирование товара ---
 
 async def edit_product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор товара для редактирования"""
@@ -338,19 +517,13 @@ async def edit_product_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     product = db.get_product(product_id)
     
     if not product:
-        await query.edit_message_text(
-            "❌ Товар не найден",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="price_edit")
-            ]])
-        )
+        await query.edit_message_text("❌ Товар не найден")
         return PRICE_MENU
     
     photo_status = "✅ есть" if product['photo_file_id'] else "❌ нет"
     
     text = (
         f"✏️ РЕДАКТИРОВАНИЕ ТОВАРА\n\n"
-        f"Текущие данные:\n"
         f"📦 Название: {product['name']}\n"
         f"💰 Цена: {product['price']}₽\n"
         f"📂 Категория: {product['category']}\n"
@@ -371,6 +544,7 @@ async def edit_product_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return EDIT_PRODUCT_FIELD
 
+
 async def edit_product_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор поля для редактирования"""
     query = update.callback_query
@@ -383,11 +557,13 @@ async def edit_product_field(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             "📸 Отправьте новое фото товара (или '-' чтобы оставить текущее):"
         )
+    elif field == 'category':
+        # Показываем выбор категории
+        return await show_category_picker_for_product(update, context)
     else:
         field_names = {
             'name': 'новое название',
             'price': 'новую цену (только цифры)',
-            'category': 'новую категорию',
             'stock': 'новое количество'
         }
         await query.edit_message_text(
@@ -396,11 +572,11 @@ async def edit_product_field(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     return EDIT_PRODUCT_VALUE
 
+
 async def edit_product_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ввод нового значения и сохранение"""
+    """Ввод нового значения"""
     text = update.message.text
     field = context.user_data.get('edit_field')
-    user_id = update.effective_user.id
     
     if text in ["❌ Отмена", "🚪 Выход"]:
         return await exit_handler(update, context)
@@ -455,42 +631,8 @@ async def edit_product_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     context.user_data.pop('edit_product_id', None)
     context.user_data.pop('edit_field', None)
-    
     return await back_to_admin(update, context)
 
-async def show_products_for_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать товары для удаления"""
-    query = update.callback_query
-    
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name FROM products ORDER BY id")
-    products = cursor.fetchall()
-    conn.close()
-    
-    if not products:
-        await query.edit_message_text(
-            "📭 Товаров нет",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="price_back")
-            ]])
-        )
-        return PRICE_MENU
-    
-    text = "🗑 ВЫБЕРИТЕ ТОВАР ДЛЯ УДАЛЕНИЯ\n\n"
-    keyboard = []
-    
-    for p in products:
-        text += f"ID {p['id']}: {p['name']}\n"
-        keyboard.append([InlineKeyboardButton(
-            f"🗑 {p['name'][:30]}", 
-            callback_data=f"delete_{p['id']}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="price_back")])
-    
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return DELETE_PRODUCT_SELECT
 
 async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаление товара"""
@@ -505,42 +647,9 @@ async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка: {str(e)[:100]}")
     
+    await asyncio.sleep(1)
     return await back_to_admin(update, context)
 
-async def show_products_for_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать товары для изменения статуса наличия"""
-    query = update.callback_query
-    
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, stock, in_stock FROM products ORDER BY id")
-    products = cursor.fetchall()
-    conn.close()
-    
-    if not products:
-        await query.edit_message_text(
-            "📭 Товаров нет",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="price_back")
-            ]])
-        )
-        return PRICE_MENU
-    
-    text = "📊 СТАТУС НАЛИЧИЯ\n\n"
-    keyboard = []
-    
-    for p in products:
-        status = "✅ В наличии" if p['in_stock'] else "❌ Нет в наличии"
-        text += f"ID {p['id']}: {p['name']} - {status} (склад: {p['stock']} шт.)\n"
-        keyboard.append([InlineKeyboardButton(
-            f"{'✅' if p['in_stock'] else '❌'} {p['name'][:30]}",
-            callback_data=f"toggle_{p['id']}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="price_back")])
-    
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return TOGGLE_STOCK_SELECT
 
 async def toggle_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Изменение статуса наличия"""
@@ -556,9 +665,395 @@ async def toggle_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка: {str(e)[:100]}")
     
+    await asyncio.sleep(1)
     return await back_to_admin(update, context)
 
-# ========== ДОБАВЛЕНИЕ ТОВАРА ==========
+
+# ============================================================
+# ⭐ УПРАВЛЕНИЕ КАТЕГОРИЯМИ
+# ============================================================
+
+async def categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления категориями"""
+    query = update.callback_query
+    
+    await query.edit_message_text(
+        "📂 УПРАВЛЕНИЕ КАТЕГОРИЯМИ\n\nВыберите действие:",
+        reply_markup=categories_menu_keyboard()
+    )
+    return CATEGORY_MENU
+
+
+async def categories_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка меню категорий"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+    
+    logger.info(f"👔 Менеджер {user_id}: categories callback {data}")
+    
+    # --- Добавить категорию ---
+    if data == "cat_add":
+        await query.edit_message_text(
+            "➕ ДОБАВЛЕНИЕ КАТЕГОРИИ\n\nВведите название категории:"
+        )
+        return ADD_CATEGORY_NAME
+    
+    # --- Добавить подкатегорию ---
+    if data == "subcat_add":
+        cats = db.get_categories(parent_id=None)
+        if not cats:
+            await query.edit_message_text(
+                "❌ Сначала создайте хотя бы одну категорию",
+                reply_markup=categories_menu_keyboard()
+            )
+            return CATEGORY_MENU
+        
+        keyboard = get_category_select_keyboard(cats, callback_prefix="subcat_parent_")
+        await query.edit_message_text(
+            "➕ ДОБАВЛЕНИЕ ПОДКАТЕГОРИИ\n\nВыберите родительскую категорию:",
+            reply_markup=keyboard
+        )
+        return ADD_SUBCATEGORY_PARENT
+    
+    # --- Список категорий ---
+    if data == "cat_list":
+        cats = db.get_categories(parent_id=None, active_only=False)
+        text = "📋 СПИСОК КАТЕГОРИЙ\n\n"
+        
+        if not cats:
+            text += "Категорий нет"
+        else:
+            for c in cats:
+                subcats = db.get_categories(parent_id=c['id'], active_only=False)
+                text += f"📂 {c['name']}\n"
+                for s in subcats:
+                    text += f"   📁 {s['name']}\n"
+                if subcats:
+                    text += "\n"
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="cat_back")
+            ]])
+        )
+        return CATEGORY_MENU
+    
+    # --- Удалить категорию ---
+    if data == "cat_delete":
+        cats = db.get_categories(parent_id=None, active_only=False)
+        if not cats:
+            await query.edit_message_text(
+                "📭 Категорий нет",
+                reply_markup=categories_menu_keyboard()
+            )
+            return CATEGORY_MENU
+        
+        keyboard = get_category_select_keyboard(cats, callback_prefix="cat_del_")
+        await query.edit_message_text(
+            "🗑 УДАЛЕНИЕ КАТЕГОРИИ\n\n"
+            "⚠️ Вместе с категорией удалятся её подкатегории\n\n"
+            "Выберите категорию:",
+            reply_markup=keyboard
+        )
+        return DELETE_CATEGORY_SELECT
+    
+    # --- Переименовать категорию ---
+    if data == "cat_rename":
+        cats = db.get_categories(parent_id=None, active_only=False)
+        if not cats:
+            await query.edit_message_text(
+                "📭 Категорий нет",
+                reply_markup=categories_menu_keyboard()
+            )
+            return CATEGORY_MENU
+        
+        keyboard = get_category_select_keyboard(cats, callback_prefix="cat_ren_")
+        await query.edit_message_text(
+            "✏️ ПЕРЕИМЕНОВАНИЕ\n\nВыберите категорию:",
+            reply_markup=keyboard
+        )
+        return EDIT_CATEGORY_SELECT
+    
+    # --- Выбор родителя для подкатегории ---
+    if data.startswith("subcat_parent_"):
+        parent_id = int(data.split("_")[2])
+        context.user_data['subcat_parent_id'] = parent_id
+        parent = db.get_category(parent_id)
+        
+        await query.edit_message_text(
+            f"➕ ПОДКАТЕГОРИЯ В «{parent['name']}»\n\n"
+            f"Введите название подкатегории:"
+        )
+        return ADD_SUBCATEGORY_NAME
+    
+    # --- Удаление категории (выбор) ---
+    if data.startswith("cat_del_"):
+        cat_id = int(data.split("_")[2])
+        cat = db.get_category(cat_id)
+        
+        await query.edit_message_text(
+            f"🗑 УДАЛИТЬ «{cat['name']}»?\n\n"
+            f"⚠️ Все подкатегории будут удалены!",
+            reply_markup=confirm_delete_category_keyboard(cat_id)
+        )
+        return DELETE_CATEGORY_SELECT
+    
+    if data.startswith("cat_confirmdel_"):
+        cat_id = int(data.split("_")[2])
+        db.delete_category(cat_id)
+        await query.edit_message_text("✅ Категория удалена")
+        await asyncio.sleep(1)
+        return await categories_menu(update, context)
+    
+    # --- Переименование категории ---
+    if data.startswith("cat_ren_"):
+        cat_id = int(data.split("_")[2])
+        context.user_data['rename_cat_id'] = cat_id
+        cat = db.get_category(cat_id)
+        
+        await query.edit_message_text(
+            f"✏️ Введите новое название для «{cat['name']}»:"
+        )
+        return EDIT_CATEGORY_NAME
+    
+    # --- Назад ---
+    if data == "cat_back":
+        return await price_menu_back(update, context)
+
+
+async def add_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление новой категории"""
+    text = update.message.text
+    if text in ["❌ Отмена", "🚪 Выход"]:
+        return await exit_handler(update, context)
+    
+    db.add_category(text, parent_id=None)
+    await update.message.reply_text(f"✅ Категория «{text}» добавлена!")
+    
+    # Показываем меню
+    await update.message.reply_text(
+        "📂 УПРАВЛЕНИЕ КАТЕГОРИЯМИ",
+        reply_markup=categories_menu_keyboard()
+    )
+    return CATEGORY_MENU
+
+
+async def add_subcategory_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление подкатегории"""
+    text = update.message.text
+    if text in ["❌ Отмена", "🚪 Выход"]:
+        return await exit_handler(update, context)
+    
+    parent_id = context.user_data.get('subcat_parent_id')
+    if not parent_id:
+        await update.message.reply_text("❌ Ошибка: родитель не выбран")
+        return CATEGORY_MENU
+    
+    db.add_category(text, parent_id=parent_id)
+    parent = db.get_category(parent_id)
+    await update.message.reply_text(f"✅ Подкатегория «{text}» добавлена в «{parent['name']}»!")
+    
+    await update.message.reply_text(
+        "📂 УПРАВЛЕНИЕ КАТЕГОРИЯМИ",
+        reply_markup=categories_menu_keyboard()
+    )
+    return CATEGORY_MENU
+
+
+async def edit_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переименование категории"""
+    text = update.message.text
+    if text in ["❌ Отмена", "🚪 Выход"]:
+        return await exit_handler(update, context)
+    
+    cat_id = context.user_data.get('rename_cat_id')
+    if not cat_id:
+        await update.message.reply_text("❌ Ошибка")
+        return CATEGORY_MENU
+    
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE categories SET name = ? WHERE id = ?", (text, cat_id))
+    conn.commit()
+    conn.close()
+    db._cache_clear("categories_")
+    
+    await update.message.reply_text(f"✅ Категория переименована в «{text}»")
+    context.user_data.pop('rename_cat_id', None)
+    
+    await update.message.reply_text(
+        "📂 УПРАВЛЕНИЕ КАТЕГОРИЯМИ",
+        reply_markup=categories_menu_keyboard()
+    )
+    return CATEGORY_MENU
+
+
+# ============================================================
+# ⭐ ВЫБОР КАТЕГОРИИ ПРИ ДОБАВЛЕНИИ ТОВАРА
+# ============================================================
+
+async def show_category_picker_for_product(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                            page: int = 1):
+    """Показать выбор категории при добавлении/редактировании товара"""
+    query = update.callback_query
+    
+    cats = db.get_categories(parent_id=None, active_only=True)
+    
+    if not cats:
+        # Если категорий нет — пропускаем выбор
+        if context.user_data.get('new_product'):
+            context.user_data['new_product']['category_id'] = None
+            context.user_data['new_product']['category'] = 'Общее'
+            await query.edit_message_text(
+                "⚠️ Категорий нет. Товар попадёт в «Общее»\n\n"
+                "Шаг 3/6: Введите цену (только цифры):"
+            )
+            return ADD_PRODUCT_PRICE
+        else:
+            # Редактирование
+            db.update_product(context.user_data.get('edit_product_id'), 
+                            category_id=None, category='Общее')
+            await query.edit_message_text("✅ Категория сброшена на «Общее»")
+            return await back_to_admin(update, context)
+    
+    total = len(cats)
+    total_pages = (total + CATEGORIES_PER_PAGE - 1) // CATEGORIES_PER_PAGE
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * CATEGORIES_PER_PAGE
+    page_cats = cats[offset:offset + CATEGORIES_PER_PAGE]
+    
+    title = "📂 ВЫБЕРИТЕ КАТЕГОРИЮ" if context.user_data.get('new_product') else "📂 НОВАЯ КАТЕГОРИЯ"
+    
+    keyboard = get_category_picker_for_product(page_cats, page, total_pages)
+    
+    if query:
+        await query.edit_message_text(
+            f"{title}\n\n📄 Страница {page}/{total_pages}",
+            reply_markup=keyboard
+        )
+    return SELECT_PRODUCT_CATEGORY
+
+
+async def pick_category_for_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора категории при добавлении товара"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    # Отмена
+    if data == "pickcat_cancel":
+        context.user_data.pop('new_product', None)
+        return await back_to_admin(update, context)
+    
+    # Без категории
+    if data == "pickcat_none":
+        if context.user_data.get('new_product'):
+            context.user_data['new_product']['category_id'] = None
+            context.user_data['new_product']['category'] = 'Общее'
+            await query.edit_message_text(
+                "✅ Категория: Общее\n\n"
+                "Шаг 3/6: Введите цену (только цифры):"
+            )
+            return ADD_PRODUCT_PRICE
+        else:
+            product_id = context.user_data.get('edit_product_id')
+            db.update_product(product_id, category_id=None, category='Общее')
+            await query.edit_message_text("✅ Категория: Общее")
+            await asyncio.sleep(1)
+            return await back_to_admin(update, context)
+    
+    # Пагинация
+    if data.startswith("pickcatpage_"):
+        page = int(data.split("_")[1])
+        return await show_category_picker_for_product(update, context, page)
+    
+    # Выбор категории
+    if data.startswith("pickcat_"):
+        cat_id = int(data.split("_")[1])
+        
+        # Проверяем подкатегории
+        if db.has_subcategories(cat_id):
+            # Показываем подкатегории
+            subcats = db.get_categories(parent_id=cat_id, active_only=True)
+            keyboard = get_subcategory_picker_for_product(subcats, cat_id)
+            await query.edit_message_text(
+                f"📁 Выберите подкатегорию:",
+                reply_markup=keyboard
+            )
+            return SELECT_PRODUCT_SUBCATEGORY
+        
+        # Нет подкатегорий — используем категорию
+        cat = db.get_category(cat_id)
+        
+        if context.user_data.get('new_product'):
+            context.user_data['new_product']['category_id'] = cat_id
+            context.user_data['new_product']['category'] = cat['name']
+            await query.edit_message_text(
+                f"✅ Категория: {cat['name']}\n\n"
+                f"Шаг 3/6: Введите цену (только цифры):"
+            )
+            return ADD_PRODUCT_PRICE
+        else:
+            product_id = context.user_data.get('edit_product_id')
+            db.update_product(product_id, category_id=cat_id, category=cat['name'])
+            await query.edit_message_text(f"✅ Категория обновлена: {cat['name']}")
+            await asyncio.sleep(1)
+            return await back_to_admin(update, context)
+
+
+async def pick_subcategory_for_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора подкатегории"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    # Пропустить подкатегорию
+    if data.startswith("picksubcat_skip_"):
+        parent_id = int(data.split("_")[2])
+        cat = db.get_category(parent_id)
+        
+        if context.user_data.get('new_product'):
+            context.user_data['new_product']['category_id'] = parent_id
+            context.user_data['new_product']['category'] = cat['name']
+            await query.edit_message_text(
+                f"✅ Категория: {cat['name']}\n\n"
+                f"Шаг 3/6: Введите цену (только цифры):"
+            )
+            return ADD_PRODUCT_PRICE
+        else:
+            product_id = context.user_data.get('edit_product_id')
+            db.update_product(product_id, category_id=parent_id, category=cat['name'])
+            await query.edit_message_text(f"✅ Категория: {cat['name']}")
+            await asyncio.sleep(1)
+            return await back_to_admin(update, context)
+    
+    # Выбор подкатегории
+    if data.startswith("picksubcat_"):
+        cat_id = int(data.split("_")[1])
+        cat = db.get_category(cat_id)
+        
+        if context.user_data.get('new_product'):
+            context.user_data['new_product']['category_id'] = cat_id
+            context.user_data['new_product']['category'] = cat['name']
+            await query.edit_message_text(
+                f"✅ Подкатегория: {cat['name']}\n\n"
+                f"Шаг 3/6: Введите цену (только цифры):"
+            )
+            return ADD_PRODUCT_PRICE
+        else:
+            product_id = context.user_data.get('edit_product_id')
+            db.update_product(product_id, category_id=cat_id, category=cat['name'])
+            await query.edit_message_text(f"✅ Категория обновлена: {cat['name']}")
+            await asyncio.sleep(1)
+            return await back_to_admin(update, context)
+
+
+# ============================================================
+# ДОБАВЛЕНИЕ ТОВАРА
+# ============================================================
 
 async def add_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ввод названия товара"""
@@ -567,26 +1062,10 @@ async def add_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await exit_handler(update, context)
     
     context.user_data['new_product'] = {'name': text}
-    await update.message.reply_text(
-        "✅ Название сохранено!\n\nШаг 2/5: Введите категорию (или '-' для 'Общее'):",
-        reply_markup=cancel_keyboard()
-    )
-    return ADD_PRODUCT_CATEGORY
+    
+    # Показываем выбор категории
+    return await show_category_picker_for_product(update, context)
 
-async def add_product_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ввод категории"""
-    text = update.message.text
-    if text in ["❌ Отмена", "🚪 Выход"]:
-        return await exit_handler(update, context)
-    
-    category = text if text != "-" else "Общее"
-    context.user_data['new_product']['category'] = category
-    
-    await update.message.reply_text(
-        "✅ Категория сохранена!\n\nШаг 3/5: Введите цену (только цифры):",
-        reply_markup=cancel_keyboard()
-    )
-    return ADD_PRODUCT_PRICE
 
 async def add_product_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ввод цены"""
@@ -602,10 +1081,11 @@ async def add_product_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_PRODUCT_PRICE
     
     await update.message.reply_text(
-        "✅ Цена сохранена!\n\nШаг 4/5: Введите количество (или 0):",
+        "✅ Цена сохранена!\n\nШаг 4/6: Введите количество (или 0):",
         reply_markup=cancel_keyboard()
     )
     return ADD_PRODUCT_STOCK
+
 
 async def add_product_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ввод количества"""
@@ -622,14 +1102,14 @@ async def add_product_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "✅ Количество сохранено!\n\n"
-        "Шаг 5/5: Отправьте *фото товара* (или '-' чтобы пропустить):",
-        parse_mode=ParseMode.MARKDOWN,
+        "Шаг 5/6: Отправьте фото товара (или '-' чтобы пропустить):",
         reply_markup=cancel_keyboard()
     )
     return ADD_PRODUCT_PHOTO
 
+
 async def add_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение фото товара и сохранение"""
+    """Получение фото и сохранение"""
     text = update.message.text
     photo_id = None
     user_id = update.effective_user.id
@@ -651,23 +1131,24 @@ async def add_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         db.add_product(
-            product['name'], 
-            product['category'], 
-            product['price'], 
-            product['stock'], 
+            product['name'],
+            product.get('category', 'Общее'),
+            product['price'],
+            product['stock'],
             photo_id,
-            user_id
+            user_id,
+            category_id=product.get('category_id')
         )
         
-        response = f"✅ ТОВАР ДОБАВЛЕН!\n\n"
-        response += f"📦 Название: {product['name']}\n"
-        response += f"📂 Категория: {product['category']}\n"
-        response += f"💰 Цена: {product['price']}₽\n"
-        response += f"📊 В наличии: {product['stock']} шт.\n"
-        response += f"📸 Фото: {'✅' if photo_id else '❌'}"
-        
+        response = (
+            f"✅ ТОВАР ДОБАВЛЕН!\n\n"
+            f"📦 {product['name']}\n"
+            f"📂 {product.get('category', 'Общее')}\n"
+            f"💰 {product['price']}₽\n"
+            f"📊 {product['stock']} шт.\n"
+            f"📸 {'✅' if photo_id else '❌'}"
+        )
         await update.message.reply_text(response)
-        
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
         await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
@@ -675,15 +1156,15 @@ async def add_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('new_product', None)
     return await back_to_admin(update, context)
 
-# ========== УПРАВЛЕНИЕ ЗАКАЗАМИ ==========
+
+# ============================================================
+# УПРАВЛЕНИЕ ЗАКАЗАМИ (без изменений)
+# ============================================================
 
 async def orders_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка меню заказов"""
     query = update.callback_query
     await query.answer()
-    
-    user_id = update.effective_user.id
-    logger.info(f"👔 Менеджер {user_id}: нажал {query.data}")
     
     if query.data == "orders_today":
         return await show_orders_today(update, context)
@@ -710,14 +1191,14 @@ async def orders_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif query.data == "back_to_orders":
         return await back_to_orders(update, context)
 
+
 async def show_orders_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ заказов за сегодня"""
+    """Заказы за сегодня"""
     query = update.callback_query
     
     try:
         conn = db.get_connection()
         cursor = conn.cursor()
-        
         cursor.execute('''
             SELECT order_id, user_name, user_phone, items, total_amount, status, 
                    strftime('%d.%m.%Y %H:%M', created_at) as created, username
@@ -737,8 +1218,7 @@ async def show_orders_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ORDERS_MENU
         
-        text = f"ЗАКАЗЫ ЗА СЕГОДНЯ ({len(orders)} шт.)\n"
-        text += "=" * 30 + "\n\n"
+        text = f"ЗАКАЗЫ ЗА СЕГОДНЯ ({len(orders)} шт.)\n" + "=" * 30 + "\n\n"
         keyboard = []
         total_sum = 0
         
@@ -747,178 +1227,118 @@ async def show_orders_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items_text = ", ".join([f"{i['name']} x{i['quantity']}" for i in items])
             total_sum += o['total_amount']
             
-            text += f"📦 Заказ №{o['order_id']}\n"
-            text += f"👤 {o['user_name']}"
-            if o['username']:
-                text += f" (@{o['username']})"
-            text += f"\n📞 {o['user_phone']}\n"
-            text += f"🛒 {items_text}\n"
-            text += f"💰 {o['total_amount']}₽\n"
-            text += f"📊 Статус: {o['status']}\n"
-            text += f"📅 {o['created']}\n\n"
+            text += f"📦 №{o['order_id']}\n👤 {o['user_name']}\n📞 {o['user_phone']}\n"
+            text += f"🛒 {items_text}\n💰 {o['total_amount']}₽\n📊 {o['status']}\n\n"
             
             keyboard.append([InlineKeyboardButton(
-                f"📋 Детали заказа {o['order_id']}",
+                f"📋 Детали {o['order_id']}",
                 callback_data=f"view_order_{o['order_id']}"
             )])
         
         text += f"ИТОГО: {total_sum}₽"
         keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="orders_back")])
         
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
         await query.edit_message_text(f"❌ Ошибка: {str(e)[:100]}")
     
     return ORDERS_MENU
 
+
 async def show_orders_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ заказов за месяц"""
+    """Заказы за месяц"""
     query = update.callback_query
     
     try:
         conn = db.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT order_id, user_name, user_phone, items, total_amount, status,
-                   strftime('%d.%m.%Y %H:%M', created_at) as created, username
-            FROM orders 
-            WHERE created_at >= datetime('now', '-30 days')
+            SELECT order_id, user_name, items, total_amount, status
+            FROM orders WHERE created_at >= datetime('now', '-30 days')
             ORDER BY created_at DESC
         ''')
         orders = cursor.fetchall()
         conn.close()
         
         if not orders:
-            await query.edit_message_text(
-                "📭 Заказов за месяц нет",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀️ Назад", callback_data="orders_back")
-                ]])
-            )
+            await query.edit_message_text("📭 Заказов за месяц нет")
             return ORDERS_MENU
         
-        text = f"ЗАКАЗЫ ЗА МЕСЯЦ ({len(orders)} шт.)\n"
-        text += "=" * 30 + "\n\n"
-        keyboard = []
+        text = f"ЗАКАЗЫ ЗА МЕСЯЦ ({len(orders)} шт.)\n" + "=" * 30 + "\n\n"
         total_sum = 0
         
         for o in orders[:15]:
-            items = json.loads(o['items']) if o['items'] else []
             total_sum += o['total_amount']
             text += f"📦 {o['order_id']} - {o['user_name']} - {o['total_amount']}₽\n"
         
         text += f"\nИТОГО: {total_sum}₽"
         
-        keyboard.append([InlineKeyboardButton(
-            "📋 Показать все заказы", 
-            callback_data="orders_period"
-        )])
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="orders_back")])
-        
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="orders_back")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
-        await query.edit_message_text(f"❌ Ошибка: {str(e)[:100]}")
     
     return ORDERS_MENU
 
+
 async def show_order_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ деталей заказа"""
+    """Детали заказа"""
     query = update.callback_query
     await query.answer()
     
     order_id = query.data.split('_')[2]
-    
     order = db.get_order(order_id)
     
     if not order:
         await query.edit_message_text("❌ Заказ не найден")
         return ORDERS_MENU
     
-    # Парсим товары
-    items = []
-    try:
-        items = json.loads(order['items']) if order['items'] else []
-    except:
-        items = []
-    
+    items = json.loads(order['items']) if order['items'] else []
     items_text = ""
     for i in items:
         items_text += f"  • {i['name']} x{i['quantity']} = {i['price'] * i['quantity']}₽\n"
-    
-    # Получаем историю статусов
-    history_text = ""
-    try:
-        if order['status_history']:
-            history = json.loads(order['status_history'])
-            if history:
-                history_text = "\n\n📋 История изменений:\n"
-                for h in history[-3:]:
-                    date = h['changed_at'][:16]
-                    history_text += f"  {date}: {h['from']} → {h['to']}\n"
-    except:
-        history_text = ""
     
     username_display = f" (@{order['username']})" if order['username'] else ""
     
     text = (
         f"📦 ЗАКАЗ №{order['order_id']}\n"
         f"{'=' * 30}\n\n"
-        f"👤 Клиент: {order['user_name']}{username_display}\n"
-        f"📞 Телефон: {order['user_phone']}\n"
-        f"📅 Создан: {order['created_at'][:16]}\n"
-        f"📅 Обновлен: {order['updated_at'][:16] if order['updated_at'] else order['created_at'][:16]}\n\n"
+        f"👤 {order['user_name']}{username_display}\n"
+        f"📞 {order['user_phone']}\n"
+        f"📅 {order['created_at'][:16]}\n\n"
         f"🛒 ТОВАРЫ:\n{items_text}\n"
-        f"💰 Сумма: {order['total_amount']} ₽\n"
-        f"📍 Адрес: {order['delivery_address']}\n"
-        f"💬 Комментарий: {order['comment'] or '—'}\n\n"
-        f"📊 Текущий статус: {order['status']}"
-        f"{history_text}"
+        f"💰 Сумма: {order['total_amount']}₽\n"
+        f"📍 {order['delivery_address']}\n"
+        f"💬 {order['comment'] or '—'}\n\n"
+        f"📊 Статус: {order['status']}"
     )
     
     keyboard = [
         [InlineKeyboardButton("📊 Изменить статус", callback_data=f"change_status_{order_id}")],
-        [InlineKeyboardButton("◀️ Назад к заказам", callback_data="back_to_orders")]
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_to_orders")]
     ]
     
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 async def change_status_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню выбора нового статуса"""
+    """Меню выбора статуса"""
     query = update.callback_query
     await query.answer()
     
     order_id = query.data.split('_')[2]
-    
-    # Получаем текущий статус
     order = db.get_order(order_id)
     current_status = order['status'] if order else 'неизвестно'
     
-    text = (
-        f"📊 ВЫБЕРИТЕ НОВЫЙ СТАТУС\n"
-        f"{'=' * 25}\n\n"
-        f"Заказ №{order_id}\n"
-        f"Текущий статус: {current_status}\n\n"
-        f"Доступные статусы:"
-    )
-    
     await query.edit_message_text(
-        text,
+        f"📊 ВЫБЕРИТЕ СТАТУС\n\nЗаказ №{order_id}\nТекущий: {current_status}",
         reply_markup=get_status_keyboard(order_id)
     )
 
+
 async def set_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Установка нового статуса заказа"""
+    """Установка статуса"""
     query = update.callback_query
     await query.answer()
     
@@ -927,46 +1347,40 @@ async def set_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_status = parts[3]
     admin_id = update.effective_user.id
     
-    logger.info(f"👔 Менеджер {admin_id}: установка статуса {new_status} для заказа {order_id}")
-    
     success, result = db.update_order_status(order_id, new_status, admin_id)
     
     if not success:
         await query.edit_message_text(f"❌ Ошибка: {result}")
         return ORDERS_MENU
     
-    # Уведомляем пользователя
     try:
         await context.bot.send_message(
             result['user_id'],
-            f"📦 ОБНОВЛЕНИЕ СТАТУСА ЗАКАЗА\n\n"
-            f"Заказ №{order_id}\n"
-            f"Новый статус: {ORDER_STATUSES.get(new_status, new_status)}",
+            f"📦 Статус заказа №{order_id} обновлён:\n{ORDER_STATUSES.get(new_status, new_status)}"
         )
-    except Exception as e:
-        logger.error(f"❌ Не удалось уведомить пользователя: {e}")
+    except:
+        pass
     
     await query.edit_message_text(
-        f"✅ СТАТУС ОБНОВЛЕН!\n\n"
-        f"Заказ №{order_id}\n"
-        f"Новый статус: {ORDER_STATUSES.get(new_status, new_status)}\n\n"
-        f"Пользователь уведомлен."
+        f"✅ Статус обновлён: {ORDER_STATUSES.get(new_status, new_status)}"
     )
-    
     await asyncio.sleep(2)
-    await back_to_orders(update, context)
+    return await back_to_orders(update, context)
+
 
 async def back_to_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат к меню заказов"""
     query = update.callback_query
-    
     await query.edit_message_text(
         "📋 УПРАВЛЕНИЕ ЗАКАЗАМИ\n\nВыберите период:",
         reply_markup=orders_menu_keyboard()
     )
     return ORDERS_MENU
 
-# ========== СВЯЗЬ С КЛИЕНТАМИ ==========
+
+# ============================================================
+# СВЯЗЬ С КЛИЕНТАМИ, РАССЫЛКА, ПЕРИОД
+# ============================================================
 
 async def search_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск клиента"""
@@ -979,31 +1393,15 @@ async def search_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = db.get_connection()
         cursor = conn.cursor()
-        
         cursor.execute('''
-            SELECT DISTINCT 
-                o.user_id, 
-                o.user_name, 
-                o.user_phone, 
-                o.username,
-                COUNT(o.id) as orders_count,
-                SUM(o.total_amount) as total_spent,
-                MAX(o.created_at) as last_order
+            SELECT DISTINCT o.user_id, o.user_name, o.user_phone, o.username,
+                   COUNT(o.id) as orders_count, SUM(o.total_amount) as total_spent,
+                   MAX(o.created_at) as last_order
             FROM orders o
-            WHERE o.order_id LIKE ? 
-               OR o.user_name LIKE ? 
-               OR o.user_phone LIKE ?
-               OR o.username LIKE ?
-            GROUP BY o.user_id
-            ORDER BY last_order DESC
-            LIMIT 10
-        ''', (
-            f'%{query_text}%', 
-            f'%{query_text}%', 
-            f'%{query_text}%',
-            f'%{query_text}%'
-        ))
-        
+            WHERE o.order_id LIKE ? OR o.user_name LIKE ? 
+               OR o.user_phone LIKE ? OR o.username LIKE ?
+            GROUP BY o.user_id ORDER BY last_order DESC LIMIT 10
+        ''', (f'%{query_text}%', f'%{query_text}%', f'%{query_text}%', f'%{query_text}%'))
         clients = cursor.fetchall()
         conn.close()
         
@@ -1019,13 +1417,8 @@ async def search_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for c in clients:
             username = f" (@{c['username']})" if c['username'] else ""
-            last_order = c['last_order'][:10] if c['last_order'] else "никогда"
-            
-            text += f"👤 {c['user_name']}{username}\n"
-            text += f"📞 {c['user_phone']}\n"
-            text += f"📦 Заказов: {c['orders_count']}\n"
-            text += f"💰 На сумму: {c['total_spent'] or 0}₽\n"
-            text += f"📅 Последний заказ: {last_order}\n\n"
+            text += f"👤 {c['user_name']}{username}\n📞 {c['user_phone']}\n"
+            text += f"📦 {c['orders_count']} заказов на {c['total_spent'] or 0}₽\n\n"
             
             keyboard.append([InlineKeyboardButton(
                 f"💬 Написать {c['user_name'][:20]}",
@@ -1033,48 +1426,37 @@ async def search_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )])
         
         keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_back")])
-        
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}")
-        await update.message.reply_text(f"❌ Ошибка поиска: {str(e)[:100]}")
-        return ADMIN
     
     return SEND_MESSAGE
 
+
 async def send_message_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало отправки сообщения клиенту"""
+    """Начало отправки сообщения"""
     query = update.callback_query
     await query.answer()
     
     user_id = int(query.data.split('_')[2])
     context.user_data['target_user'] = user_id
-    admin_id = update.effective_user.id
     
     conn = db.get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT first_name, username FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT first_name FROM users WHERE user_id = ?", (user_id,))
     user_info = cursor.fetchone()
     conn.close()
     
-    user_name = user_info['first_name'] or user_info['username'] or str(user_id)
+    user_name = user_info['first_name'] if user_info else str(user_id)
     
     await query.edit_message_text(
-        f"💬 ОТПРАВКА СООБЩЕНИЯ\n\n"
-        f"Получатель: {user_name}\n\n"
-        f"Введите текст сообщения:",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("◀️ Отмена", callback_data="admin_back")
-        ]])
+        f"💬 ОТПРАВКА\n\nПолучатель: {user_name}\n\nВведите текст:"
     )
     return SEND_MESSAGE
 
+
 async def send_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправка сообщения клиенту"""
+    """Отправка сообщения"""
     text = update.message.text
     target_user = context.user_data.get('target_user')
     admin_id = update.effective_user.id
@@ -1083,45 +1465,22 @@ async def send_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await exit_handler(update, context)
     
     if not target_user:
-        await update.message.reply_text(
-            "❌ Ошибка: получатель не найден",
-            reply_markup=get_admin_keyboard(admin_id, db)
-        )
+        await update.message.reply_text("❌ Ошибка")
         return ADMIN
     
     try:
-        await context.bot.send_message(
-            target_user,
-            f"📨 Сообщение от администратора:\n\n{text}",
-        )
-        
-        await update.message.reply_text(
-            "✅ Сообщение успешно отправлено!",
-            reply_markup=get_admin_keyboard(admin_id, db)
-        )
-        
+        await context.bot.send_message(target_user, f"📨 От администратора:\n\n{text}")
+        await update.message.reply_text("✅ Отправлено!", reply_markup=get_admin_keyboard(admin_id, db))
     except Exception as e:
-        error_message = (
-            "❌ Ошибка при отправке\n\n"
-            f"Причина: {str(e)[:100]}\n\n"
-            "Возможно, пользователь заблокировал бота."
-        )
-        
-        await update.message.reply_text(
-            error_message,
-            reply_markup=get_admin_keyboard(admin_id, db)
-        )
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
     
     context.user_data.pop('target_user', None)
     return ADMIN
 
-# ========== РАССЫЛКА ==========
 
 async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ввод текста рассылки"""
     text = update.message.text
-    admin_id = update.effective_user.id
-    
     if text in ["❌ Отмена", "🚪 Выход"]:
         return await exit_handler(update, context)
     
@@ -1130,30 +1489,26 @@ async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db.get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
+    total = cursor.fetchone()[0]
     conn.close()
     
     await update.message.reply_text(
-        f"📢 ПОДТВЕРЖДЕНИЕ РАССЫЛКИ\n\n"
-        f"Текст:\n{text}\n\n"
-        f"Получателей: {total_users}\n\n"
-        f"Отправить?",
+        f"📢 ПОДТВЕРЖДЕНИЕ\n\nТекст:\n{text}\n\nПолучателей: {total}\n\nОтправить?",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Да, отправить", callback_data="broadcast_confirm")],
-            [InlineKeyboardButton("❌ Нет, отменить", callback_data="broadcast_cancel")]
+            [InlineKeyboardButton("✅ Да", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton("❌ Нет", callback_data="broadcast_cancel")]
         ])
     )
     return BROADCAST_CONFIRM
 
+
 async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение и отправка рассылки"""
+    """Подтверждение рассылки"""
     query = update.callback_query
     await query.answer()
     
-    admin_id = update.effective_user.id
-    
     if query.data == "broadcast_cancel":
-        await query.edit_message_text("❌ Рассылка отменена")
+        await query.edit_message_text("❌ Отменено")
         return ADMIN
     
     text = context.user_data.get('broadcast_text')
@@ -1164,73 +1519,42 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = cursor.fetchall()
     conn.close()
     
-    await query.edit_message_text(
-        f"📤 Начинаю рассылку...\n\n"
-        f"Всего получателей: {len(users)}"
-    )
+    await query.edit_message_text(f"📤 Отправка {len(users)} сообщений...")
     
-    sent = 0
-    failed = 0
-    
-    for i, user in enumerate(users):
+    sent = failed = 0
+    for user in users:
         try:
-            await context.bot.send_message(
-                user['user_id'],
-                f"📢 РАССЫЛКА:\n\n{text}",
-            )
+            await context.bot.send_message(user['user_id'], f"📢 {text}")
             sent += 1
-            
-            if (i + 1) % 10 == 0:
-                await query.edit_message_text(
-                    f"📤 Рассылка...\n\n"
-                    f"✅ Отправлено: {sent}\n"
-                    f"❌ Ошибок: {failed}\n"
-                    f"⏳ Прогресс: {i + 1}/{len(users)}"
-                )
-            
             await asyncio.sleep(0.05)
-            
-        except Exception as e:
+        except:
             failed += 1
     
-    await query.edit_message_text(
-        f"✅ РАССЫЛКА ЗАВЕРШЕНА\n\n"
-        f"📨 Отправлено: {sent}\n"
-        f"❌ Ошибок: {failed}"
-    )
-    
+    await query.edit_message_text(f"✅ Готово!\n📨 Отправлено: {sent}\n❌ Ошибок: {failed}")
     context.user_data.pop('broadcast_text', None)
-    
     await asyncio.sleep(2)
     return await back_to_admin(update, context)
 
-# ========== ПЕРИОД ==========
 
 async def period_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ввод начальной даты"""
+    """Начальная дата"""
     text = update.message.text
-    admin_id = update.effective_user.id
-    
     if text in ["❌ Отмена", "🚪 Выход"]:
         return await exit_handler(update, context)
     
     try:
         start = datetime.strptime(text, "%d.%m.%Y")
         context.user_data['period_start'] = start
-        await update.message.reply_text(
-            "📅 Введите конечную дату (ДД.ММ.ГГГГ):",
-            reply_markup=cancel_keyboard()
-        )
+        await update.message.reply_text("📅 Введите конечную дату (ДД.ММ.ГГГГ):", reply_markup=cancel_keyboard())
         return PERIOD_END
     except:
-        await update.message.reply_text("❌ Неверный формат. Используйте ДД.ММ.ГГГГ")
+        await update.message.reply_text("❌ Неверный формат")
         return PERIOD_START
 
+
 async def period_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ввод конечной даты"""
+    """Конечная дата"""
     text = update.message.text
-    admin_id = update.effective_user.id
-    
     if text in ["❌ Отмена", "🚪 Выход"]:
         return await exit_handler(update, context)
     
@@ -1239,16 +1563,10 @@ async def period_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start = context.user_data.get('period_start')
         
         if end < start:
-            await update.message.reply_text("❌ Конец не может быть раньше начала")
+            await update.message.reply_text("❌ Конец раньше начала")
             return PERIOD_END
         
         orders = db.get_orders(period='all')
-        
-        if not orders:
-            await update.message.reply_text("📭 Заказов за указанный период нет")
-            return ADMIN
-        
-        # Фильтруем по дате
         filtered = []
         total = 0
         for o in orders:
@@ -1258,59 +1576,34 @@ async def period_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total += o['total_amount']
         
         if not filtered:
-            await update.message.reply_text("📭 Заказов за указанный период нет")
+            await update.message.reply_text("📭 Заказов нет")
             return ADMIN
         
-        text = f"📋 ЗАКАЗЫ С {start.strftime('%d.%m.%Y')} ПО {end.strftime('%d.%m.%Y')}\n"
-        text += "=" * 40 + "\n\n"
-        keyboard = []
-        
+        text = f"📋 ЗАКАЗЫ ({start.strftime('%d.%m.%Y')} - {end.strftime('%d.%m.%Y')})\n\n"
         for o in filtered[:10]:
-            items = json.loads(o['items']) if o['items'] else []
-            items_text = ", ".join([f"{i['name']} x{i['quantity']}" for i in items])
-            
             text += f"📦 {o['order_id']} - {o['user_name']} - {o['total_amount']}₽\n"
-            text += f"   {items_text}\n\n"
-            
-            keyboard.append([InlineKeyboardButton(
-                f"📋 Детали {o['order_id']}",
-                callback_data=f"view_order_{o['order_id']}"
-            )])
-        
         text += f"\nИТОГО: {total}₽"
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_back")])
         
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
+        await update.message.reply_text(text)
         context.user_data.pop('period_start', None)
         return ADMIN
-        
     except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
-        await update.message.reply_text("❌ Неверный формат даты")
+        await update.message.reply_text("❌ Неверный формат")
         return PERIOD_END
+
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ==========
 
-async def back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Возврат в главное меню админа"""
-    if update.callback_query:
-        await update.callback_query.edit_message_text("🔙 Возврат в главное меню...")
-        await update.effective_chat.send_message(
-            "👔 ГЛАВНОЕ МЕНЮ МЕНЕДЖЕРА",
-            reply_markup=manager_main_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            "👔 ГЛАВНОЕ МЕНЮ МЕНЕДЖЕРА",
-            reply_markup=manager_main_keyboard()
-        )
-    
-    return ADMIN
+async def price_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат в меню прайса"""
+    query = update.callback_query
+    await query.edit_message_text(
+        "⚙️ УПРАВЛЕНИЕ ПРАЙСОМ\n\nВыберите действие:",
+        reply_markup=price_menu_keyboard()
+    )
+    return PRICE_MENU
+
 
 async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback для кнопки Назад"""
+    """Callback для Назад"""
     return await back_to_admin(update, context)

@@ -4,12 +4,12 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime
-from functools import lru_cache
-from config import SUPER_ADMIN_IDS
 import os
+from datetime import datetime
+from config import SUPER_ADMIN_IDS
 
 logger = logging.getLogger(__name__)
+
 
 class Database:
     """Оптимизированная БД с кэшированием и пулом соединений"""
@@ -31,7 +31,7 @@ class Database:
         self.init_db()
         self.update_structure()
         self._cache = {}
-        self._cache_timeout = 60  # 60 секунд кэширования
+        self._cache_timeout = 60
         self._initialized = True
     
     def get_connection(self):
@@ -39,13 +39,12 @@ class Database:
         conn = sqlite3.connect(self.db_name, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")  # Режим WAL для конкурентного доступа
-        conn.execute("PRAGMA synchronous = NORMAL")  # Баланс скорости и надежности
-        conn.execute("PRAGMA cache_size = 10000")  # Увеличиваем кэш
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA cache_size = 10000")
         return conn
     
     def _cache_get(self, key):
-        """Получение из кэша"""
         if key in self._cache:
             value, timestamp = self._cache[key]
             if time.time() - timestamp < self._cache_timeout:
@@ -53,11 +52,9 @@ class Database:
         return None
     
     def _cache_set(self, key, value):
-        """Сохранение в кэш"""
         self._cache[key] = (value, time.time())
     
     def _cache_clear(self, pattern=None):
-        """Очистка кэша"""
         if pattern:
             self._cache = {k: v for k, v in self._cache.items() if not k.startswith(pattern)}
         else:
@@ -87,7 +84,6 @@ class Database:
             )
         ''')
         
-        # Индексы для users
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_referral ON users(referral_code)')
         
@@ -102,25 +98,44 @@ class Database:
             )
         ''')
         
-        # Товары
+        # ⭐ НОВОЕ: Категории с поддержкой подкатегорий
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                parent_id INTEGER DEFAULT NULL,
+                sort_order INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT,
+                FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE CASCADE
+            )
+        ''')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_categories_active ON categories(is_active)')
+        
+        # ⭐ ОБНОВЛЕНО: Товары с category_id и photo_path
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 category TEXT DEFAULT 'Общее',
+                category_id INTEGER DEFAULT NULL,
                 price REAL NOT NULL,
                 stock INTEGER DEFAULT 0,
                 photo_file_id TEXT,
+                photo_path TEXT,
                 in_stock INTEGER DEFAULT 0,
                 created_at TEXT,
                 updated_at TEXT,
                 created_by INTEGER,
-                updated_by INTEGER
+                updated_by INTEGER,
+                FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
             )
         ''')
         
-        # Индексы для products
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_in_stock ON products(in_stock)')
         
         # Заказы с историей статусов
@@ -144,7 +159,6 @@ class Database:
             )
         ''')
         
-        # Индексы для orders
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)')
@@ -178,28 +192,32 @@ class Database:
         logger.info("✅ База данных инициализирована")
     
     def update_structure(self):
-        """Обновление структуры БД"""
+        """Обновление структуры БД (миграции)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Добавляем недостающие колонки
-        try:
-            cursor.execute("ALTER TABLE orders ADD COLUMN comment TEXT")
-            logger.info("✅ Добавлена колонка comment")
-        except:
-            pass
+        # Добавляем недостающие колонки в orders
+        for col, sql in [
+            ("comment", "ALTER TABLE orders ADD COLUMN comment TEXT"),
+            ("status_history", "ALTER TABLE orders ADD COLUMN status_history TEXT DEFAULT '[]'"),
+            ("updated_at", "ALTER TABLE orders ADD COLUMN updated_at TEXT"),
+        ]:
+            try:
+                cursor.execute(sql)
+                logger.info(f"✅ Добавлена колонка {col}")
+            except:
+                pass
         
-        try:
-            cursor.execute("ALTER TABLE orders ADD COLUMN status_history TEXT DEFAULT '[]'")
-            logger.info("✅ Добавлена колонка status_history")
-        except:
-            pass
-        
-        try:
-            cursor.execute("ALTER TABLE orders ADD COLUMN updated_at TEXT")
-            logger.info("✅ Добавлена колонка updated_at")
-        except:
-            pass
+        # ⭐ НОВОЕ: добавляем category_id и photo_path в products
+        for col, sql in [
+            ("category_id", "ALTER TABLE products ADD COLUMN category_id INTEGER"),
+            ("photo_path", "ALTER TABLE products ADD COLUMN photo_path TEXT"),
+        ]:
+            try:
+                cursor.execute(sql)
+                logger.info(f"✅ Добавлена колонка {col} в products")
+            except:
+                pass
         
         conn.commit()
         conn.close()
@@ -207,7 +225,6 @@ class Database:
     # ========== РАБОТА С ПОЛЬЗОВАТЕЛЯМИ ==========
     
     def get_user_role(self, user_id):
-        """Получение роли пользователя (с кэшированием)"""
         cache_key = f"user_role_{user_id}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -224,11 +241,9 @@ class Database:
         return role
     
     def is_superadmin(self, user_id):
-        """Проверка на суперадмина"""
         return user_id in SUPER_ADMIN_IDS
     
     def is_manager(self, user_id):
-        """Проверка на менеджера (с кэшированием)"""
         cache_key = f"is_manager_{user_id}"
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -245,17 +260,14 @@ class Database:
         return is_manager
     
     def register_user(self, user_id, username, first_name, last_name, referrer_id=None):
-        """Регистрация нового пользователя"""
         import hashlib
         
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Генерация реферального кода
         hash_obj = hashlib.md5(f"{user_id}{datetime.now()}".encode())
         referral_code = hash_obj.hexdigest()[:10]
         
-        # Определяем роль
         role = 'superadmin' if user_id in SUPER_ADMIN_IDS else 'user'
         
         cursor.execute('''
@@ -268,7 +280,6 @@ class Database:
               referral_code, referrer_id, role))
         
         if referrer_id:
-            # Получаем имена для реферальной записи
             cursor.execute("SELECT first_name, username FROM users WHERE user_id = ?", (referrer_id,))
             referrer = cursor.fetchone()
             
@@ -287,17 +298,108 @@ class Database:
                 UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?
             ''', (referrer_id,))
             
-            # Очищаем кэш
             self._cache_clear(f"referrals_{referrer_id}")
         
         conn.commit()
         conn.close()
         
-        # Очищаем кэш
         self._cache_clear(f"user_role_{user_id}")
         self._cache_clear(f"is_manager_{user_id}")
         
         return referral_code
+    
+    # ========== РАБОТА С КАТЕГОРИЯМИ (НОВОЕ) ==========
+    
+    def add_category(self, name, parent_id=None):
+        """Добавить категорию или подкатегорию"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO categories (name, parent_id, created_at)
+            VALUES (?, ?, ?)
+        ''', (name, parent_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        cat_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        self._cache_clear("categories_")
+        return cat_id
+    
+    def get_categories(self, parent_id=None, active_only=True):
+        """Получить категории (верхний уровень или подкатегории)"""
+        cache_key = f"categories_{parent_id}_{active_only}"
+        cached = self._cache_get(cache_key)
+        if cached:
+            return cached
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        if parent_id is None:
+            query = "SELECT id, name, parent_id FROM categories WHERE parent_id IS NULL"
+        else:
+            query = "SELECT id, name, parent_id FROM categories WHERE parent_id = ?"
+        
+        params = [] if parent_id is None else [parent_id]
+        
+        if active_only:
+            query += " AND is_active = 1"
+        
+        query += " ORDER BY sort_order, name"
+        
+        cursor.execute(query, params)
+        categories = cursor.fetchall()
+        conn.close()
+        
+        result = [dict(c) for c in categories]
+        self._cache_set(cache_key, result)
+        return result
+    
+    def get_category(self, category_id):
+        """Получить категорию по ID"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, parent_id FROM categories WHERE id = ?", (category_id,))
+        cat = cursor.fetchone()
+        conn.close()
+        return dict(cat) if cat else None
+    
+    def delete_category(self, category_id):
+        """Удалить категорию и все её подкатегории"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        # Удаляем подкатегории
+        cursor.execute("SELECT id FROM categories WHERE parent_id = ?", (category_id,))
+        subcats = cursor.fetchall()
+        for sub in subcats:
+            cursor.execute("DELETE FROM categories WHERE id = ?", (sub['id'],))
+        cursor.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        conn.commit()
+        conn.close()
+        self._cache_clear("categories_")
+        return True
+    
+    def has_subcategories(self, category_id):
+        """Проверить, есть ли у категории подкатегории"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id = ? AND is_active = 1", (category_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
+    
+    def count_categories(self, parent_id=None):
+        """Количество категорий (для пагинации)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        if parent_id is None:
+            cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id IS NULL AND is_active = 1")
+        else:
+            cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id = ? AND is_active = 1", (parent_id,))
+        
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
     
     # ========== РАБОТА С ТОВАРАМИ ==========
     
@@ -311,17 +413,19 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        query = "SELECT id, name, category, price, stock, photo_file_id FROM products WHERE 1=1"
+        query = """SELECT p.id, p.name, p.category, p.category_id, p.price, p.stock, 
+                          p.photo_file_id, p.photo_path 
+                   FROM products p WHERE 1=1"""
         params = []
         
         if only_in_stock:
-            query += " AND in_stock = 1 AND stock > 0"
+            query += " AND p.in_stock = 1 AND p.stock > 0"
         
         if category:
-            query += " AND category = ?"
+            query += " AND p.category = ?"
             params.append(category)
         
-        query += " ORDER BY category, name"
+        query += " ORDER BY p.category, p.name"
         
         cursor.execute(query, params)
         products = cursor.fetchall()
@@ -330,6 +434,65 @@ class Database:
         result = [dict(p) for p in products]
         self._cache_set(cache_key, result)
         return result
+    
+    def get_products_by_category(self, category_id, page=1, per_page=5):
+        """⭐ Товары категории с пагинацией"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        offset = (page - 1) * per_page
+        
+        cursor.execute('''
+            SELECT COUNT(*) FROM products 
+            WHERE category_id = ? AND in_stock = 1 AND stock > 0
+        ''', (category_id,))
+        total = cursor.fetchone()[0]
+        
+        cursor.execute('''
+            SELECT id, name, price, stock, photo_file_id, photo_path 
+            FROM products 
+            WHERE category_id = ? AND in_stock = 1 AND stock > 0
+            ORDER BY name
+            LIMIT ? OFFSET ?
+        ''', (category_id, per_page, offset))
+        
+        products = cursor.fetchall()
+        conn.close()
+        
+        return {
+            'products': [dict(p) for p in products],
+            'total': total,
+            'pages': (total + per_page - 1) // per_page if total > 0 else 1,
+            'current_page': page
+        }
+    
+    def get_all_products_paginated(self, page=1, per_page=5):
+        """⭐ Все товары без категории — с пагинацией"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        offset = (page - 1) * per_page
+        
+        cursor.execute("SELECT COUNT(*) FROM products WHERE in_stock = 1 AND stock > 0")
+        total = cursor.fetchone()[0]
+        
+        cursor.execute('''
+            SELECT id, name, price, stock, photo_file_id, photo_path 
+            FROM products 
+            WHERE in_stock = 1 AND stock > 0
+            ORDER BY name
+            LIMIT ? OFFSET ?
+        ''', (per_page, offset))
+        
+        products = cursor.fetchall()
+        conn.close()
+        
+        return {
+            'products': [dict(p) for p in products],
+            'total': total,
+            'pages': (total + per_page - 1) // per_page if total > 0 else 1,
+            'current_page': page
+        }
     
     def get_product(self, product_id):
         """Получение товара по ID (с кэшированием)"""
@@ -341,7 +504,8 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT id, name, category, price, stock, photo_file_id, in_stock
+            SELECT id, name, category, category_id, price, stock, 
+                   photo_file_id, photo_path, in_stock
             FROM products WHERE id = ?
         ''', (product_id,))
         product = cursor.fetchone()
@@ -351,17 +515,19 @@ class Database:
         self._cache_set(cache_key, result)
         return result
     
-    def add_product(self, name, category, price, stock, photo_file_id, created_by):
-        """Добавление нового товара"""
+    def add_product(self, name, category, price, stock, photo_file_id, created_by, 
+                    category_id=None, photo_path=None):
+        """⭐ Добавление нового товара (с category_id и photo_path)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             INSERT INTO products 
-            (name, category, price, stock, photo_file_id, in_stock, created_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (name, category, category_id, price, stock, photo_file_id, photo_path, 
+             in_stock, created_at, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            name, category, price, stock, photo_file_id,
+            name, category, category_id, price, stock, photo_file_id, photo_path,
             1 if stock > 0 else 0,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             created_by
@@ -371,13 +537,13 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Очищаем кэш товаров
         self._cache_clear("products_")
         return product_id
     
     def update_product(self, product_id, **kwargs):
         """Обновление товара"""
-        allowed_fields = {'name', 'category', 'price', 'stock', 'photo_file_id', 'in_stock'}
+        allowed_fields = {'name', 'category', 'category_id', 'price', 'stock', 
+                          'photo_file_id', 'photo_path', 'in_stock'}
         updates = []
         values = []
         
@@ -399,7 +565,6 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Очищаем кэш
         self._cache_clear(f"product_{product_id}")
         self._cache_clear("products_")
         return True
@@ -412,7 +577,6 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Очищаем кэш
         self._cache_clear(f"product_{product_id}")
         self._cache_clear("products_")
         return True
@@ -432,7 +596,6 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Очищаем кэш
         self._cache_clear(f"product_{product_id}")
         self._cache_clear("products_")
         return new_status
@@ -444,7 +607,6 @@ class Database:
         import random
         import string
         
-        # Генерация номера заказа
         date = datetime.now().strftime("%Y%m%d")
         random_part = ''.join(random.choices(string.digits, k=6))
         order_id = f"ORD-{date}-{random_part}"
@@ -452,7 +614,6 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # История статусов
         history = [{
             'from': 'none',
             'to': 'new',
@@ -472,7 +633,6 @@ class Database:
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ))
         
-        # Обновляем остатки товаров
         for item in items:
             cursor.execute('''
                 UPDATE products 
@@ -481,10 +641,8 @@ class Database:
                 WHERE id = ?
             ''', (item['quantity'], item['quantity'], item['product_id']))
             
-            # Очищаем кэш товара
             self._cache_clear(f"product_{item['product_id']}")
         
-        # Если есть реферальная связь, обновляем
         cursor.execute('''
             SELECT r.id, r.referrer_id 
             FROM referrals r
@@ -494,26 +652,20 @@ class Database:
         referral = cursor.fetchone()
         if referral:
             cursor.execute('UPDATE referrals SET order_made = 1 WHERE id = ?', (referral['id'],))
-            
-            # Увеличиваем счетчик рефералов
             cursor.execute('''
                 UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?
             ''', (referral['referrer_id'],))
-            
-            # Очищаем кэш
             self._cache_clear(f"user_role_{referral['referrer_id']}")
         
         conn.commit()
         conn.close()
         
-        # Очищаем кэш заказов
         self._cache_clear("orders_")
         self._cache_clear("products_")
         
         return order_id
     
     def get_orders(self, period='all', user_id=None, limit=50):
-        """Получение заказов (с кэшированием)"""
         cache_key = f"orders_{period}_{user_id}_{limit}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -546,7 +698,6 @@ class Database:
         return result
     
     def get_order(self, order_id):
-        """Получение заказа по ID (с кэшированием)"""
         cache_key = f"order_{order_id}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -563,7 +714,6 @@ class Database:
         return result
     
     def update_order_status(self, order_id, new_status, admin_id):
-        """Обновление статуса заказа"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -598,7 +748,6 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Очищаем кэш
         self._cache_clear(f"order_{order_id}")
         self._cache_clear("orders_")
         
@@ -607,7 +756,6 @@ class Database:
     # ========== УПРАВЛЕНИЕ МЕНЕДЖЕРАМИ ==========
     
     def add_manager(self, manager_id, added_by):
-        """Добавление менеджера"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -624,14 +772,12 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Очищаем кэш
         self._cache_clear(f"user_role_{manager_id}")
         self._cache_clear("managers_")
         
         return True
     
     def remove_manager(self, manager_id):
-        """Удаление менеджера"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -641,14 +787,12 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Очищаем кэш
         self._cache_clear(f"user_role_{manager_id}")
         self._cache_clear("managers_")
         
         return True
     
     def get_managers(self, active_only=True):
-        """Получение списка менеджеров (с кэшированием)"""
         cache_key = f"managers_{active_only}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -677,7 +821,6 @@ class Database:
     # ========== РЕФЕРАЛЫ ==========
     
     def get_referrals(self, user_id):
-        """Получение списка рефералов пользователя (с кэшированием)"""
         cache_key = f"referrals_{user_id}"
         cached = self._cache_get(cache_key)
         if cached:
@@ -701,8 +844,6 @@ class Database:
     # ========== СТАТИСТИКА ==========
     
     def get_stats(self):
-    
-        """Получение статистики (с кэшированием)"""
         cache_key = "stats"
         cached = self._cache_get(cache_key)
         if cached:
@@ -720,10 +861,16 @@ class Database:
         cursor.execute("SELECT COUNT(*) FROM products WHERE in_stock = 1 AND stock > 0")
         stats['in_stock'] = cursor.fetchone()[0]
         
-        # ВАЖНО: Добавляем вычисление общего количества товаров на складе
         cursor.execute("SELECT SUM(stock) FROM products")
         total_stock = cursor.fetchone()[0]
         stats['total_stock'] = total_stock if total_stock else 0
+        
+        # ⭐ НОВОЕ: Категории
+        cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id IS NULL")
+        stats['total_categories'] = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM categories WHERE parent_id IS NOT NULL")
+        stats['total_subcategories'] = cursor.fetchone()[0]
         
         # Пользователи
         cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'user'")
@@ -758,7 +905,6 @@ class Database:
         cursor.execute("SELECT COUNT(*) FROM referrals WHERE order_made = 1")
         stats['referrals_with_orders'] = cursor.fetchone()[0]
         
-        # Топ рефереров
         cursor.execute('''
             SELECT u.first_name, u.username, COUNT(r.id) as ref_count, SUM(r.order_made) as orders_made
             FROM users u
