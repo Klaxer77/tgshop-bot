@@ -186,13 +186,13 @@ async def import_products_callback(update: Update, context: ContextTypes.DEFAULT
     categories, cat_errors = gs.import_categories()
     
     cats_added = 0
-    cat_map = {}  # name -> id
+    gs_id_to_db_id = {}  # ID из Google Sheets → ID в БД бота
     
     try:
         conn = db.get_connection()
         cursor = conn.cursor()
         
-        # Сначала главные категории
+        # ЭТАП 1: Главные категории (без родителя)
         for c in categories:
             if not c['parent_id']:
                 cursor.execute(
@@ -200,44 +200,54 @@ async def import_products_callback(update: Update, context: ContextTypes.DEFAULT
                     (c['name'],)
                 )
                 existing = cursor.fetchone()
-                if not existing:
+                
+                if existing:
+                    db_id = existing['id']
+                else:
                     cursor.execute(
                         "INSERT INTO categories (name, parent_id, created_at) VALUES (?, NULL, ?)",
                         (c['name'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     )
-                    cat_map[c['name']] = cursor.lastrowid
+                    db_id = cursor.lastrowid
                     cats_added += 1
-                else:
-                    cat_map[c['name']] = existing['id']
+                
+                if c['id']:
+                    gs_id_to_db_id[c['id']] = db_id
+                gs_id_to_db_id[c['name']] = db_id
         
-        # Затем подкатегории (2-й проход)
+        # ЭТАП 2: Подкатегории (с родителем)
         for c in categories:
             if c['parent_id']:
-                # Ищем родителя по ID из таблицы
-                cursor.execute("SELECT id, name FROM categories WHERE id = ?", (c['parent_id'],))
-                parent = cursor.fetchone()
-                if not parent:
+                parent_db_id = gs_id_to_db_id.get(c['parent_id'])
+                
+                if not parent_db_id:
+                    logger.warning(f"⚠️ Родитель {c['parent_id']} не найден для '{c['name']}'")
                     continue
                 
                 cursor.execute(
                     "SELECT id FROM categories WHERE name = ? AND parent_id = ?",
-                    (c['name'], parent['id'])
+                    (c['name'], parent_db_id)
                 )
                 existing = cursor.fetchone()
-                if not existing:
+                
+                if existing:
+                    db_id = existing['id']
+                else:
                     cursor.execute(
                         "INSERT INTO categories (name, parent_id, created_at) VALUES (?, ?, ?)",
-                        (c['name'], parent['id'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                        (c['name'], parent_db_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     )
-                    cat_map[c['name']] = cursor.lastrowid
+                    db_id = cursor.lastrowid
                     cats_added += 1
-                else:
-                    cat_map[c['name']] = existing['id']
+                
+                if c['id']:
+                    gs_id_to_db_id[c['id']] = db_id
+                gs_id_to_db_id[c['name']] = db_id
         
-        # Обновляем cat_map с уже существующими категориями
+        # Обновляем словарь по имени из БД
         cursor.execute("SELECT id, name FROM categories")
         for row in cursor.fetchall():
-            cat_map[row['name']] = row['id']
+            gs_id_to_db_id[row['name']] = row['id']
         
         conn.commit()
         conn.close()
@@ -261,8 +271,8 @@ async def import_products_callback(update: Update, context: ContextTypes.DEFAULT
             existing = cursor.fetchone()
             
             if not existing:
-                # Ищем category_id по названию
-                category_id = cat_map.get(p['category_name'])
+                # Ищем category_id по названию категории
+                category_id = gs_id_to_db_id.get(p['category_name'])
                 
                 cursor.execute('''
                     INSERT INTO products 
